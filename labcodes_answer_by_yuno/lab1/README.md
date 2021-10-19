@@ -136,3 +136,113 @@
 	spin:
 		jmp spin
 	```
+
+# 练习4
+1. 读取扇区的源码如下：
+
+	```
+	static void
+	waitdisk(void) {
+		while ((inb(0x1F7) & 0xC0) != 0x40)
+			/* do nothing */;
+	}
+
+	/* readsect - read a single sector at @secno into @dst */
+	static void
+	readsect(void *dst, uint32_t secno) {
+		// wait for disk to be ready
+		waitdisk();
+
+		outb(0x1F2, 1);                         // count = 1
+		outb(0x1F3, secno & 0xFF);
+		outb(0x1F4, (secno >> 8) & 0xFF);
+		outb(0x1F5, (secno >> 16) & 0xFF);
+		outb(0x1F6, ((secno >> 24) & 0xF) | 0xE0);
+		outb(0x1F7, 0x20);                      // cmd 0x20 - read sectors
+
+		// wait for disk to be ready
+		waitdisk();
+
+		// read a sector
+		insl(0x1F0, dst, SECTSIZE / 4);
+	}
+
+	/* *
+	* readseg - read @count bytes at @offset from kernel into virtual address @va,
+	* might copy more than asked.
+	* */
+	```
+
+	主要原理为等待硬盘控制器就绪+向指定端口发送数据，这种方式我们称为LBA（逻辑区块地址）方式。具体参数为：
+	- 向0x1f2端口传入要读取的扇区数
+	- 向0x1f3-0x1f6端口传入32位LBA地址
+	- 向0x1f7端口传入读/写命令，其中0x20为读
+	- 从0x1f7端口读取硬盘控制器状态，高两位为01时表示就绪
+	- 从0x1f0端口读数据
+
+2. 加载elf格式内核的源码如下：
+
+	```
+		if (ELFHDR->e_magic != ELF_MAGIC) {
+			goto bad;
+		}
+
+		struct proghdr *ph, *eph;
+
+		// load each program segment (ignores ph flags)
+		ph = (struct proghdr *)((uintptr_t)ELFHDR + ELFHDR->e_phoff);
+		eph = ph + ELFHDR->e_phnum;
+		for (; ph < eph; ph ++) {
+			readseg(ph->p_va & 0xFFFFFF, ph->p_memsz, ph->p_offset);
+		}
+
+		// call the entry point from the ELF header
+		// note: does not return
+		((void (*)(void))(ELFHDR->e_entry & 0xFFFFFF))();
+
+	bad:
+		outw(0x8A00, 0x8A00);
+		outw(0x8A00, 0x8E00);
+
+		/* do nothing */
+		while (1);
+	```
+
+	源代码中elf.h提供了对elf格式的支持。其结构如下：
+
+	```
+	struct elfhdr {
+		uint32_t e_magic;     // must equal ELF_MAGIC
+		uint8_t e_elf[12];
+		uint16_t e_type;      // 1=relocatable, 2=executable, 3=shared object, 4=core image
+		uint16_t e_machine;   // 3=x86, 4=68K, etc.
+		uint32_t e_version;   // file version, always 1
+		uint32_t e_entry;     // entry point if executable
+		uint32_t e_phoff;     // file position of program header or 0
+		uint32_t e_shoff;     // file position of section header or 0
+		uint32_t e_flags;     // architecture-specific flags, usually 0
+		uint16_t e_ehsize;    // size of this elf header
+		uint16_t e_phentsize; // size of an entry in program header
+		uint16_t e_phnum;     // number of entries in program header or 0
+		uint16_t e_shentsize; // size of an entry in section header
+		uint16_t e_shnum;     // number of entries in section header or 0
+		uint16_t e_shstrndx;  // section number that contains section name strings
+	};
+	```
+
+	将ELF文件头载入内存后，bootmain函数按照地址排布将ELF文件头转换为结构体。首先判断magic魔数是否为0x464C457FU（.ELF），若不是则直接交给bad块进行错误处理；接着将划分程序段的部分（phoff）交给proghdr结构体，其格式如下：
+
+	```
+	struct proghdr {
+		uint32_t p_type;   // loadable code or data, dynamic linking info,etc.
+		uint32_t p_offset; // file offset of segment
+		uint32_t p_va;     // virtual address to map segment
+		uint32_t p_pa;     // physical address, not used
+		uint32_t p_filesz; // size of segment in file
+		uint32_t p_memsz;  // size of segment in memory (bigger if contains bss）
+		uint32_t p_flags;  // read/write/execute bits
+		uint32_t p_align;  // required alignment, invariably hardware page size
+	};
+	```
+
+	按照以上段的排布，bootmain函数向硬盘读取程序的各个段，最终跳转至程序的起点。自此内核被成功启动。
